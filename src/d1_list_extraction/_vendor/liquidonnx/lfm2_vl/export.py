@@ -1,0 +1,314 @@
+#!/usr/bin/env python3
+"""
+Export LFM2-VL models to ONNX for onnxruntime-genai.
+
+The fp32, q4 and q8 decoders come from the onnxruntime-genai model builder (CPU EP, inputs_embeds
+in; see liquidonnx.genai_builder). This repository builds the vision encoder and the embedding model
+that splices image features into the token embeddings, and derives the other precisions.
+
+Output Structure:
+    {output-dir}/exports/{model-name}-ONNX/
+        ├── genai_config.json            # decoder, embedding and vision at the default precision
+        ├── genai_processor_config.json  # onnxruntime-genai image preprocessing
+        ├── config.json, generation_config.json, processor_config.json
+        ├── tokenizer.json, tokenizer_config.json, chat_template.jinja
+        └── onnx/
+            ├── decoder.onnx             # fp32; decoder_{fp16,q4,q8}.onnx as in lfm2-export
+            ├── vision_encoder.onnx      # fp32; vision_encoder_fp16.onnx
+            ├── vision_encoder_q8.onnx   # int8, used with q4 and q8
+            ├── embeddings.onnx          # token table + image feature scatter (fp32 table)
+            ├── embeddings_fp16.onnx     # fp16 table, used with fp16
+            ├── embeddings_q8.onnx       # int8 table, used with q4 and q8
+            └── *.onnx_data              # weights, in --split-data chunks
+
+genai_config.json uses the first exported precision of q4, q8, fp16, fp32; bundle() lists the
+files each precision loads.
+
+Usage:
+    # Export from HuggingFace (fp32 only)
+    uv run lfm2-vl-export LiquidAI/LFM2.5-VL-1.6B
+
+    # Export with all precisions (fp16, q4, q8)
+    uv run lfm2-vl-export LiquidAI/LFM2.5-VL-1.6B --precision
+
+    # Export with specific precisions
+    uv run lfm2-vl-export LiquidAI/LFM2-VL-450M --precision fp16 q4
+
+    # Add precisions to an existing export without rebuilding fp32
+    uv run lfm2-vl-export LiquidAI/LFM2-VL-450M --precision q4 --skip-export
+"""
+
+import argparse
+import gc
+import json
+import logging
+import pathlib
+
+from liquidonnx import remote_code_enabled
+from liquidonnx.embeddings import build_embeddings, derive_embeddings, embeddings_file
+from liquidonnx.export_cli import (
+    add_export_arguments,
+    finish,
+    log_step,
+    output_dir,
+    parse_precisions,
+)
+from liquidonnx.genai_builder import export_decoder, export_precision
+from liquidonnx.lfm2_vl.builder import LFM2VLConfig, VisionEmbedBuilder
+from liquidonnx.quantize import (
+    DEFAULT_BLOCK_SIZE,
+    convert_to_fp16,
+    quantize_model,
+    save_model,
+)
+
+logger = logging.getLogger(__name__)
+
+PRECISIONS = ("fp16", "q4", "q8")
+DEFAULT_ORDER = ("q4", "q8", "fp16")
+DECODER_OPTIONS = {"exclude_embeds": "true"}
+GENAI_PROCESSOR_CONFIG = "genai_processor_config.json"
+# olive-recipes #619's vision quantization. int4 weights or int8 activations (accuracy_level 4)
+# put some LFM2.5-VL-1.6B image tokens below 0.7 cosine to HF fp32; these keep all above 0.96.
+VISION_QUANT = {"bits": 8, "block_size": 128, "symmetric": True, "accuracy_level": 0}
+INTERPOLATION = {2: "LINEAR", 3: "CUBIC"}  # PIL resample -> onnxruntime-extensions Resize
+# LFM2.5-VL-3B's pre-tokenizer pattern, which onnxruntime-extensions cannot parse, and the
+# equivalent one the rest of the line uses (same tokens on chat prompts).
+UNSUPPORTED_PATTERN = (
+    r"'(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*"
+    r"|\s*[\r\n]|\s+(?!\S)|\s"
+)
+SUPPORTED_PATTERN = (
+    r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*"
+    r"|\s*[\r\n]+|\s+(?!\S)|\s+"
+)
+
+
+def bundle(precision: str) -> dict[str, str]:
+    """ONNX files (in onnx/) that make up one precision."""
+    suffix = "" if precision == "fp32" else f"_{precision}"
+    vision_suffix = {"fp32": "", "fp16": "_fp16", "q4": "_q8", "q8": "_q8"}[precision]
+    return {
+        "decoder": f"decoder{suffix}.onnx",
+        "vision": f"vision_encoder{vision_suffix}.onnx",
+        "embedding": embeddings_file(precision),
+    }
+
+
+def genai_files(precision: str) -> dict:
+    """genai_config.json model entries that load one precision."""
+    return {name: {"filename": f"onnx/{file}"} for name, file in bundle(precision).items()}
+
+
+def export_vl_model(model_path: str, output_dir: pathlib.Path):
+    """fp32 decoder, vision encoder and embedding model, plus config, processor and tokenizer."""
+    import torch
+    from transformers import AutoConfig, AutoModelForImageTextToText, AutoProcessor
+
+    onnx_dir = output_dir / "onnx"
+    onnx_dir.mkdir(parents=True, exist_ok=True)
+
+    config = AutoConfig.from_pretrained(model_path, trust_remote_code=remote_code_enabled())
+    vl_config = LFM2VLConfig.from_hf_config(config)
+
+    logger.info(f"Loading weights from {model_path}...")
+    model = AutoModelForImageTextToText.from_pretrained(
+        model_path, torch_dtype=torch.float32, trust_remote_code=remote_code_enabled()
+    )
+    weights = {name: param.detach().numpy() for name, param in model.named_parameters()}
+    del model
+    gc.collect()
+
+    # === 1. Vision encoder (SigLIP2 + projector) ===
+    logger.info("Exporting vision_encoder...")
+    vision_builder = VisionEmbedBuilder(vl_config)
+    vision_builder.load_weights(weights)
+    save_model(vision_builder.build(), onnx_dir / "vision_encoder.onnx")
+    del vision_builder
+    gc.collect()
+
+    # === 2. Embedding model ===
+    logger.info("Exporting embeddings...")
+    build_embeddings(
+        weights["model.language_model.embed_tokens.weight"],
+        vl_config.image_token_id,
+        "image_features",
+        onnx_dir / "embeddings.onnx",
+    )
+    weights.clear()
+    gc.collect()
+
+    # === 3. Decoder (onnxruntime-genai model builder) ===
+    export_decoder(model_path, output_dir, "decoder.onnx", DECODER_OPTIONS)
+
+    # === 4. Processor and tokenizer ===
+    AutoProcessor.from_pretrained(
+        model_path, trust_remote_code=remote_code_enabled()
+    ).save_pretrained(output_dir)
+    fix_tokenizer_pattern(output_dir / "tokenizer.json")
+
+
+def fix_tokenizer_pattern(tokenizer_path: pathlib.Path):
+    """Swap a pre-tokenizer pattern onnxruntime-extensions cannot parse for its equivalent."""
+    text = tokenizer_path.read_text()
+    unsupported = json.dumps(UNSUPPORTED_PATTERN)
+    if unsupported in text:
+        tokenizer_path.write_text(text.replace(unsupported, json.dumps(SUPPORTED_PATTERN)))
+        logger.info("Replaced the pre-tokenizer pattern onnxruntime-extensions cannot parse")
+
+
+def derive_precision_files(
+    model_path: str,
+    output_dir: pathlib.Path,
+    precision: str,
+    block_size: int = DEFAULT_BLOCK_SIZE,
+):
+    """Write the files bundle(precision) loads."""
+    onnx_dir = output_dir / "onnx"
+    files = bundle(precision)
+    export_precision(
+        model_path,
+        output_dir,
+        "lfm2_vl",
+        precision,
+        name="decoder",
+        extra_options=DECODER_OPTIONS,
+        block_size=block_size,
+    )
+
+    vision = onnx_dir / files["vision"]
+    if precision == "fp16":
+        convert_to_fp16(onnx_dir / "vision_encoder.onnx", vision, keep_io=True)
+    else:
+        quantize_model(
+            onnx_dir / "vision_encoder.onnx", vision, exclude_lm_head=False, **VISION_QUANT
+        )
+
+    derive_embeddings(onnx_dir, precision, block_size)
+
+
+def genai_processor_config(image_processor) -> dict:
+    """onnxruntime-genai's lfm2_vl image processor, configured like the upstream processor.
+
+    Images are resized once (no tiling), to between min_image_tokens and max_image_tokens.
+    """
+    patch = image_processor.encoder_patch_size
+    merge = image_processor.downsample_factor
+    pixels_per_token = patch**2 * merge**2
+    resize = {
+        "height": 512,
+        "width": 512,
+        "interpolation": INTERPOLATION[int(image_processor.resample)],
+        "smart_resize": 1,
+        "min_pixels": image_processor.min_image_tokens * pixels_per_token,
+        "max_pixels": image_processor.max_image_tokens * pixels_per_token,
+        "patch_size": patch,
+        "merge_size": merge,
+    }
+    transforms = [
+        ("decode_image", "DecodeImage", {"color_space": "RGB"}),
+        ("resize", "Resize", resize),
+        ("rescale", "Rescale", {"rescale_factor": image_processor.rescale_factor}),
+        (
+            "normalize",
+            "Normalize",
+            {"mean": list(image_processor.image_mean), "std": list(image_processor.image_std)},
+        ),
+        ("to_channel_first", "Permute3D", {"dims": [2, 0, 1]}),
+        ("image_sizes", "PixtralImageSizes", None),
+    ]
+    return {
+        "processor": {
+            "name": "lfm2_vl_image_processor",
+            "transforms": [
+                {"operation": {"name": name, "type": kind, **({"attrs": attrs} if attrs else {})}}
+                for name, kind, attrs in transforms
+            ],
+        }
+    }
+
+
+def write_genai_config(output_dir: pathlib.Path, precision: str):
+    """Point genai_config.json at one precision and add the embedding and vision sections."""
+    from transformers import AutoProcessor
+
+    image_processor = AutoProcessor.from_pretrained(output_dir).image_processor
+    (output_dir / GENAI_PROCESSOR_CONFIG).write_text(
+        json.dumps(genai_processor_config(image_processor), indent=4)
+    )
+
+    files = genai_files(precision)
+    config_path = output_dir / "genai_config.json"
+    config = json.loads(config_path.read_text())
+    model = config["model"]
+    model["decoder"].update(files["decoder"])
+    model["embedding"] = {
+        **files["embedding"],
+        "inputs": {"input_ids": "input_ids", "image_features": "image_features"},
+        "outputs": {"inputs_embeds": "inputs_embeds"},
+    }
+    merge = image_processor.downsample_factor
+    model["vision"] = {
+        **files["vision"],
+        "config_filename": GENAI_PROCESSOR_CONFIG,
+        "patch_size": image_processor.encoder_patch_size,
+        "spatial_merge_size": merge,
+        "max_num_patches": image_processor.max_image_tokens * merge**2,
+        "inputs": {
+            "pixel_values": "pixel_values",
+            "attention_mask": "pixel_attention_mask",
+            "image_sizes": "spatial_shapes",
+        },
+        "outputs": {"image_features": "image_features"},
+    }
+    config_path.write_text(json.dumps(config, indent=4))
+    logger.info(f"genai_config.json -> {precision}: {', '.join(bundle(precision).values())}")
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Export LFM2-VL models to ONNX for onnxruntime-genai",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__,
+    )
+    add_export_arguments(parser, PRECISIONS, PRECISIONS, "LiquidAI/LFM2.5-VL-1.6B")
+    parser.add_argument(
+        "--skip-export",
+        action="store_true",
+        help="Reuse the existing fp32 graphs instead of rebuilding them",
+    )
+    args = parser.parse_args()
+
+    logging.basicConfig(level=logging.INFO)
+
+    precisions = parse_precisions(parser, args, PRECISIONS, PRECISIONS)
+    export_dir = output_dir(args)
+    onnx_dir = export_dir / "onnx"
+
+    if args.skip_export:
+        required = [onnx_dir / f for f in bundle("fp32").values()]
+        required.append(export_dir / "genai_config.json")
+        for path in required:
+            if not path.exists():
+                parser.error(f"--skip-export needs an existing {path}")
+    else:
+        log_step(f"Exporting {args.model} (fp32) to {export_dir}")
+        export_vl_model(args.model, export_dir)
+
+    for precision in precisions:
+        log_step(f"Exporting {precision}")
+        derive_precision_files(args.model, export_dir, precision, args.block_size)
+
+    # Rebuilding fp32 makes precisions from earlier runs stale; --skip-export keeps them valid.
+    available = precisions
+    if args.skip_export:
+        available = [
+            p for p in PRECISIONS if all((onnx_dir / f).exists() for f in bundle(p).values())
+        ]
+    write_genai_config(export_dir, next((p for p in DEFAULT_ORDER if p in available), "fp32"))
+
+    finish(args, export_dir, precisions)
+
+
+if __name__ == "__main__":
+    main()

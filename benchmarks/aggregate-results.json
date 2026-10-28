@@ -1,0 +1,83 @@
+{
+  "status": "exploratory follow-up on reused evaluation records, not independent blind validation",
+  "records": 24,
+  "development_records": 8,
+  "evaluation_records": 16,
+  "question_level_targets": 28,
+  "distinct_source_mentions": 14,
+  "question_profile": [
+    "people",
+    "products",
+    "organizations",
+    "combined"
+  ],
+  "labels": "agent-authored, source-grounded; private text and captures not distributed",
+  "metrics": {
+    "baseline": {
+      "tp": 24,
+      "predicted": 26,
+      "gold": 28,
+      "precision": 0.9230769230769231,
+      "recall": 0.8571428571428571,
+      "f1": 0.8888888888888888,
+      "exact_lists": 60,
+      "positive_exact_lists": [
+        15,
+        19
+      ],
+      "multi_mention_exact_lists": [
+        5,
+        6
+      ],
+      "zero_correctly_empty": [
+        45,
+        45
+      ]
+    },
+    "atomic": {
+      "tp": 26,
+      "predicted": 26,
+      "gold": 28,
+      "precision": 1.0,
+      "recall": 0.9285714285714286,
+      "f1": 0.9629629629629629,
+      "exact_lists": 62,
+      "positive_exact_lists": [
+        17,
+        19
+      ],
+      "multi_mention_exact_lists": [
+        6,
+        6
+      ],
+      "zero_correctly_empty": [
+        45,
+        45
+      ]
+    },
+    "soft": {
+      "tp": 26,
+      "predicted": 26,
+      "gold": 28,
+      "precision": 1.0,
+      "recall": 0.9285714285714286,
+      "f1": 0.9629629629629629,
+      "exact_lists": 62,
+      "positive_exact_lists": [
+        17,
+        19
+      ],
+      "multi_mention_exact_lists": [
+        6,
+        6
+      ],
+      "zero_correctly_empty": [
+        45,
+        45
+      ]
+    }
+  },
+  "prior_correct_retained": 24,
+  "new_correct_targets": 2,
+  "portable_decoder_parity_outputs": 576
+}

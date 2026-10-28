@@ -1,0 +1,368 @@
+"""
+Quantization and precision conversion for ONNX models.
+
+Weight-only MatMulNBits quantization (quantize_model / quantize_matmuls) for the vision encoder and
+the audio graphs, GatherBlockQuantized tables (quantize_gathers) for the audio embedding, and
+convert_to_fp16 for their fp16 versions and the fp16 and q4f16 decoders. The genai builder
+quantizes the LFM2 decoders (liquidonnx.genai_builder.DECODER_PRESETS); liquidonnx.lfm3.quantize
+quantizes the LFM3 ones with quantize_matmuls.
+"""
+
+import logging
+import pathlib
+
+import numpy as np
+import onnx
+from onnx import helper, numpy_helper
+from onnxruntime.quantization.matmul_nbits_quantizer import (
+    DefaultWeightOnlyQuantConfig,
+    KQuantWeightOnlyQuantConfig,
+    MatMulNBitsQuantizer,
+)
+
+logger = logging.getLogger(__name__)
+
+DEFAULT_BLOCK_SIZE = 32
+SCALE_EPS = 1e-10
+
+
+def find_lm_head_node(model) -> str | None:
+    """Find the lm_head MatMul node name."""
+    for node in model.graph.node:
+        if node.op_type == "MatMul":
+            for inp in node.input:
+                if "lm_head" in inp.lower():
+                    return node.name
+    return None
+
+
+def get_total_model_size_mb(path: pathlib.Path) -> float:
+    """Return total model size in MB (model + all external data files).
+
+    Handles split external data files (e.g., model.onnx_data, model.onnx_data_1).
+    """
+    total = path.stat().st_size / 1e6 if path.exists() else 0
+
+    # Check for external data files (model.onnx_data, model.onnx_data_1, etc.)
+    base_data = path.with_suffix(".onnx_data")
+    if base_data.exists():
+        total += base_data.stat().st_size / 1e6
+
+    # Check for split data files
+    i = 1
+    while True:
+        split_data = path.parent / f"{path.stem}.onnx_data_{i}"
+        if not split_data.exists():
+            break
+        total += split_data.stat().st_size / 1e6
+        i += 1
+
+    return total
+
+
+def load_model(path: pathlib.Path) -> onnx.ModelProto:
+    return onnx.load(str(path), load_external_data=True)
+
+
+def save_model(model: onnx.ModelProto, path: pathlib.Path) -> pathlib.Path:
+    """Save with all tensors in one `{stem}.onnx_data` file next to the graph."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    for old in path.parent.glob(f"{path.stem}.onnx_data*"):
+        old.unlink()
+    onnx.save_model(
+        model,
+        str(path),
+        save_as_external_data=True,
+        all_tensors_to_one_file=True,
+        location=f"{path.stem}.onnx_data",
+        size_threshold=1024,
+        convert_attribute=False,
+    )
+    return path
+
+
+# === Block quantization ===
+
+
+def _blocks(weight: np.ndarray, block_size: int) -> np.ndarray:
+    """[..., K] -> [..., n_blocks, block_size], zero-padding K to a whole number of blocks."""
+    *batch_dims, k = weight.shape
+    n_blocks = (k + block_size - 1) // block_size
+    if n_blocks * block_size != k:
+        pad = np.zeros((*batch_dims, n_blocks * block_size - k), dtype=weight.dtype)
+        weight = np.concatenate([weight, pad], axis=-1)
+    return weight.reshape(*batch_dims, n_blocks, block_size)
+
+
+def quantize_int8_block(
+    weight: np.ndarray, block_size: int = DEFAULT_BLOCK_SIZE
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Asymmetric uint8 quantization along the last axis: (quant [..., K], scales, zero points)."""
+    blocked = _blocks(weight, block_size)
+    batch_dims = blocked.shape[:-2]
+    w_min = blocked.min(axis=-1, keepdims=True)
+    w_max = blocked.max(axis=-1, keepdims=True)
+
+    scale = (w_max - w_min) / 255.0
+    scale = np.where(scale < SCALE_EPS, 1.0, scale)
+    zero_point = np.round(-w_min / scale).clip(0, 255)
+    quant = np.round(blocked / scale + zero_point).clip(0, 255).astype(np.uint8)
+
+    return (
+        quant.reshape(*batch_dims, -1),
+        scale.squeeze(-1).astype(np.float32),
+        zero_point.squeeze(-1).astype(np.uint8),
+    )
+
+
+def quantize_symmetric_block(
+    weight: np.ndarray, bits: int, block_size: int = DEFAULT_BLOCK_SIZE
+) -> tuple[np.ndarray, np.ndarray]:
+    """Symmetric 4- or 8-bit quantization along the last axis: (quant, scales).
+
+    Each block's largest-magnitude weight maps to -2^(bits-1), as in Q4_0 and Olive's block
+    quantizer. quant is uint8 offset by 2^(bits-1), the zero point GatherBlockQuantized assumes
+    when it has none, with two 4-bit values per byte, low nibble first.
+    """
+    k = weight.shape[-1]
+    blocked = _blocks(weight, block_size)
+    half = 1 << (bits - 1)
+    w_max = blocked.max(axis=-1, keepdims=True)
+    w_min = blocked.min(axis=-1, keepdims=True)
+    scale = np.where(np.abs(w_max) > np.abs(w_min), w_max, w_min) / -half
+    quant = np.round(blocked / np.where(scale == 0, 1, scale)).clip(-half, half - 1) + half
+    quant = quant.astype(np.uint8).reshape(*blocked.shape[:-2], -1)
+    if bits == 4:
+        quant = quant[..., 0::2] | (quant[..., 1::2] << 4)
+    return quant[..., : (k * bits + 7) // 8], scale.squeeze(-1).astype(np.float32)
+
+
+def quantize_gathers(
+    model: onnx.ModelProto, *, bits: int, block_size: int = DEFAULT_BLOCK_SIZE
+) -> onnx.ModelProto:
+    """Gather from a constant table -> GatherBlockQuantized, blocks along the table's last axis
+    (quantize_symmetric_block)."""
+    graph = model.graph
+    tables = {init.name: init for init in graph.initializer}
+    for node in graph.node:
+        if node.op_type != "Gather" or node.input[0] not in tables:
+            continue
+        table = tables.pop(node.input[0])
+        weight = numpy_helper.to_array(table)
+        quant, scales = quantize_symmetric_block(weight, bits, block_size)
+        names = [f"{table.name}_quant", f"{table.name}_scales"]
+        graph.initializer.remove(table)
+        graph.initializer.extend(
+            [numpy_helper.from_array(quant, names[0]), numpy_helper.from_array(scales, names[1])]
+        )
+        axis = next((helper.get_attribute_value(a) for a in node.attribute if a.name == "axis"), 0)
+        node.CopyFrom(
+            helper.make_node(
+                "GatherBlockQuantized",
+                [names[0], node.input[1], names[1]],
+                node.output,
+                name=node.name,
+                domain="com.microsoft",
+                bits=bits,
+                block_size=block_size,
+                gather_axis=axis,
+                quantize_axis=weight.ndim - 1,
+            )
+        )
+    if all(opset.domain != "com.microsoft" for opset in model.opset_import):
+        model.opset_import.append(helper.make_opsetid("com.microsoft", 1))
+    return model
+
+
+def convert_to_fp16(
+    input_path: pathlib.Path,
+    output_path: pathlib.Path,
+    keep_io: tuple[str, ...] | bool = ("logits", "hidden_states", "inputs_embeds"),
+) -> pathlib.Path:
+    """fp16 weights, activations and cache I/O; the named graph I/O (all of it if True) stays fp32.
+
+    Keeping inputs_embeds fp32 lets one embedding model feed a decoder of any precision.
+    """
+    from onnxruntime.transformers.float16 import convert_float_to_float16
+
+    logger.info(f"Converting {input_path.name} to FP16...")
+    model_fp16 = convert_float_to_float16(
+        load_model(input_path),
+        keep_io_types=keep_io if isinstance(keep_io, bool) else list(keep_io),
+        force_fp16_initializers=True,
+        disable_shape_infer=True,
+    )
+    save_model(model_fp16, output_path)
+
+    orig_mb = get_total_model_size_mb(input_path)
+    fp16_mb = get_total_model_size_mb(output_path)
+    logger.info(f"  {input_path.name}: {orig_mb:.1f} -> {fp16_mb:.1f} MB")
+    return output_path
+
+
+def rename_quantized_weights(model: onnx.ModelProto):
+    """Rename quantized weight initializers to match community convention.
+
+    Transforms:
+      - model.layers.X.Y.MatMul.weight_Q4 -> model_layers_X_Y_MatMul_weight_quant
+      - model.layers.X.Y.MatMul.weight_scales -> model_layers_X_Y_MatMul_weight_scales
+      - model.layers.X.Y.MatMul.weight_zero_points -> model_layers_X_Y_MatMul_weight_zp
+
+    The onnxruntime quantizer uses dots and _Q4/_zero_points suffixes,
+    community uses underscores and _quant/_zp suffixes.
+    """
+    graph = model.graph
+    renames = {}
+
+    for init in graph.initializer:
+        old_name = init.name
+        # Only rename quantized weight tensors (contain MatMul and are quantized)
+        if "MatMul" not in old_name:
+            continue
+        if not any(suffix in old_name for suffix in ["_Q4", "_scales", "_zero_points"]):
+            continue
+
+        # Convert dots to underscores for quantized weights
+        new_name = old_name.replace(".", "_")
+        # Rename suffixes to match community
+        new_name = new_name.replace("_Q4", "_quant")
+        new_name = new_name.replace("_zero_points", "_zp")
+
+        if new_name != old_name:
+            renames[old_name] = new_name
+            init.name = new_name
+
+    # Update node inputs that reference renamed initializers
+    for node in graph.node:
+        for i, inp in enumerate(node.input):
+            if inp in renames:
+                node.input[i] = renames[inp]
+
+
+def quantize_matmuls(
+    model: onnx.ModelProto,
+    *,
+    bits: int,
+    block_size: int = DEFAULT_BLOCK_SIZE,
+    symmetric: bool = False,
+    accuracy_level: int = 4,
+    exclude: list[str] | None = None,
+    algorithm: str = "rtn",
+    node_bits: dict[str, int] | None = None,
+) -> onnx.ModelProto:
+    """MatMul -> MatMulNBits (int4 or int8) for every MatMul not named in exclude.
+
+    accuracy_level is MatMulNBits' compute type: 4 quantizes the activations to int8, 0 keeps them
+    in the input type.
+
+    algorithm "rtn" is onnxruntime's default, round to nearest over each block's range. "k_quant"
+    is its port of llama.cpp's Q4_K search for the scale and offset with the least weighted error
+    in each block, the algorithm of the genai builder's q4 decoders. k_quant always writes zero
+    points (so symmetric is not for it) and its tensors keep onnxruntime's names (weight_Q4G32,
+    weight_scale, weight_zp), as those decoders do. node_bits, for k_quant only, maps the names of
+    the MatMuls that get another width than bits to theirs. onnxruntime's k_quant raises on an int4
+    MatMul whose input size is an odd number of blocks: it packs the zero points in pairs across
+    the rows.
+    """
+    if algorithm not in ("rtn", "k_quant"):
+        raise ValueError(f"Unknown algorithm {algorithm!r}: rtn or k_quant")
+    k_quant = algorithm == "k_quant"
+    if k_quant and symmetric:
+        raise ValueError("k_quant always writes zero points: it has no symmetric form")
+    if node_bits and not k_quant:
+        raise ValueError("node_bits needs algorithm='k_quant'")
+
+    quant_type = "k_quant" if k_quant else "symmetric" if symmetric else "asymmetric"
+    logger.info(
+        f"Quantizing to INT{bits} (block_size={block_size}, {quant_type}, "
+        f"accuracy_level={accuracy_level})..."
+    )
+    # The quantizer logs every node it leaves alone, hundreds of lines for an MoE graph.
+    logging.getLogger("onnxruntime.quantization.matmul_nbits_quantizer").setLevel(logging.WARNING)
+
+    kwargs = {}
+    if k_quant:
+        node_bits = node_bits or {}
+        matmuls = [node.name for node in model.graph.node if node.op_type == "MatMul"]
+        unknown = sorted(set(node_bits) - set(matmuls))
+        if unknown:
+            raise ValueError(f"node_bits names no MatMul: {', '.join(unknown)}")
+        # onnxruntime gives k_quant's MatMuls 4 bits unless the config names them
+        kwargs["algo_config"] = KQuantWeightOnlyQuantConfig(
+            customized_weight_config={name: {"bits": node_bits.get(name, bits)} for name in matmuls}
+        )
+        # Without cupy, k_quant logs a line for every MatMul
+        logging.getLogger("neural_compressor").setLevel(logging.WARNING)
+    elif bits != 4:
+        kwargs["algo_config"] = DefaultWeightOnlyQuantConfig(
+            block_size=block_size,
+            is_symmetric=symmetric,
+            accuracy_level=accuracy_level,
+            bits=bits,
+        )
+    quantizer = MatMulNBitsQuantizer(
+        model,
+        block_size=block_size,
+        is_symmetric=symmetric,
+        accuracy_level=accuracy_level,
+        nodes_to_exclude=exclude or None,
+        **kwargs,
+    )
+    quantizer.process()
+
+    quantized = quantizer.model.model
+    if k_quant:
+        # Unlike the default quantizer, k_quant doesn't declare MatMulNBits' domain
+        if all(opset.domain != "com.microsoft" for opset in quantized.opset_import):
+            quantized.opset_import.append(helper.make_opsetid("com.microsoft", 1))
+    else:
+        rename_quantized_weights(quantized)
+    return quantized
+
+
+def quantize_model(
+    model_path: pathlib.Path,
+    output_path: pathlib.Path,
+    *,
+    bits: int = 4,
+    block_size: int = DEFAULT_BLOCK_SIZE,
+    exclude_lm_head: bool = True,
+    symmetric: bool = False,
+    accuracy_level: int = 4,
+) -> pathlib.Path:
+    """Quantize ONNX model to INT4 or INT8 using MatMulNBits.
+
+    By default, lm_head is kept in FP32 (matches community approach).
+    Use exclude_lm_head=False to quantize it as well.
+
+    Args:
+        model_path: Input ONNX model path
+        output_path: Output quantized model path
+        bits: Quantization bits (4 or 8)
+        block_size: Block size for quantization
+        exclude_lm_head: Keep lm_head in FP32
+        symmetric: Use symmetric quantization (no zero points). Default False matches community.
+        accuracy_level: MatMulNBits compute type (see quantize_matmuls)
+    """
+    logger.info(f"Loading {model_path}...")
+    model = load_model(model_path)
+
+    exclude = []
+    if exclude_lm_head:
+        lm_head_node = find_lm_head_node(model)
+        if lm_head_node:
+            exclude.append(lm_head_node)
+            logger.info(f"Keeping lm_head in FP32 (excluding: {lm_head_node})")
+        else:
+            logger.warning("Could not find lm_head node")
+
+    quantized = quantize_matmuls(
+        model,
+        bits=bits,
+        block_size=block_size,
+        symmetric=symmetric,
+        accuracy_level=accuracy_level,
+        exclude=exclude,
+    )
+    logger.info(f"Saving to {output_path}...")
+    return save_model(quantized, output_path)
